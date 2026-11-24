@@ -1,0 +1,521 @@
+name: RDP - Windows (Windows Server 2022 hoặc Windows 11 ARM64)
+
+# RDP tạm thời trên GitHub Actions.
+# - 4 vCPU / 16 GB RAM / 14 GB SSD nếu repo PUBLIC (Windows private chỉ 2 vCPU / 8 GB).
+# - Tối đa 6 giờ cho mỗi lần chạy; runner là máy ảo dùng một lần.
+# - Audio qua RDP (Remote Audio). Scream virtual audio là tùy chọn.
+# - Mesa llvmpipe (OpenGL) + lavapipe (Vulkan), giới hạn thread bằng LP_NUM_THREADS.
+#
+# LƯU Ý: GitHub Actions không được thiết kế để làm máy tính từ xa.
+# Chỉ dùng để học/kiểm thử ngắn hạn, đừng dùng để đào coin hay chạy dịch vụ 24/7.
+
+run-name: RDP - Windows ${{ inputs.os }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: "Windows (chọn bản nào)"
+        type: choice
+        options:
+          - windows-2022
+          - windows-11-arm
+        default: windows-2022
+      tunnel:
+        description: "Cách kết nối"
+        type: choice
+        options:
+          - tailscale
+          - ngrok
+        default: tailscale
+      mesa_threads:
+        description: "Số thread Mesa (1 = ít RAM nhất, 2 = khuyến nghị, 4 = nhanh nhất)"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "4"
+        default: "2"
+      install_mesa:
+        description: "Cài Mesa OpenGL + Vulkan (lavapipe)"
+        type: boolean
+        default: true
+      install_scream:
+        description: "Cài Scream virtual audio (chỉ cần cho ScreamReader; Remote Audio không cần)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: rdp-win
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rdp:
+    # Gộp 2 job trùng lặp thành 1: kiến trúc (x64/ARM64) được nhận diện lúc chạy.
+    name: RDP - ${{ inputs.os }}
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 360
+    env:
+      RDP_USER: runneradmin
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+      NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+      MESA_THREADS: ${{ inputs.mesa_threads }}
+      TUNNEL: ${{ inputs.tunnel }}
+      INSTALL_SCREAM: ${{ inputs.install_scream }}
+      # NLA: tắt khi dùng Tailscale (mạng riêng), BẬT khi dùng ngrok (cổng public, chống dò mật khẩu).
+      NLA: ${{ inputs.tunnel == 'ngrok' && '1' || '0' }}
+
+    steps:
+      - name: 1. Kiểm tra secret và cấu hình
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw 'Thiếu secret RDP_PASSWORD. Vào Settings > Secrets and variables > Actions để tạo.'
+          }
+          if ($env:TUNNEL -eq 'tailscale' -and [string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            throw 'Thiếu secret TAILSCALE_AUTHKEY (hoặc chọn tunnel = ngrok).'
+          }
+          if ($env:TUNNEL -eq 'ngrok' -and [string]::IsNullOrWhiteSpace($env:NGROK_AUTHTOKEN)) {
+            throw 'Thiếu secret NGROK_AUTHTOKEN (hoặc chọn tunnel = tailscale).'
+          }
+          if ($env:MESA_THREADS -notin @('1', '2', '3', '4')) {
+            throw 'mesa_threads phải là 1, 2, 3 hoặc 4.'
+          }
+          Write-Host "Tunnel: $env:TUNNEL | Mesa threads: $env:MESA_THREADS | Arch: $env:PROCESSOR_ARCHITECTURE | NLA: $env:NLA"
+
+      - name: 2. Đặt mật khẩu và bật Remote Desktop
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          try {
+            $secure = ConvertTo-SecureString -String $env:RDP_PASSWORD -AsPlainText -Force
+            Set-LocalUser -Name $env:RDP_USER -Password $secure
+          } catch {
+            throw "Không đặt được mật khẩu: $($_.Exception.Message). Hãy dùng mật khẩu mạnh: >= 12 ký tự, có chữ hoa, chữ thường, số và ký tự đặc biệt."
+          }
+          net accounts /maxpwage:unlimited | Out-Null
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $env:RDP_USER -ErrorAction SilentlyContinue
+
+          $ts = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+          Set-ItemProperty -Path $ts -Name fDenyTSConnections -Value 0 -Type DWord
+
+          $tcp = "$ts\WinStations\RDP-Tcp"
+          Set-ItemProperty -Path $tcp -Name fEnableWinStation -Value 1 -Type DWord
+          Set-ItemProperty -Path $tcp -Name UserAuthentication -Value ([int]$env:NLA) -Type DWord
+          Set-ItemProperty -Path $tcp -Name fDisableAudio -Value 0 -Type DWord        # bật âm thanh
+          Set-ItemProperty -Path $tcp -Name fDisableCam -Value 0 -Type DWord
+          Set-ItemProperty -Path $tcp -Name fDisableClip -Value 0 -Type DWord         # bật clipboard
+
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService -ErrorAction SilentlyContinue
+
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName 'RDP 3389 (any)' -Direction Inbound -Protocol TCP `
+            -LocalPort 3389 -Action Allow -Profile Any -ErrorAction SilentlyContinue | Out-Null
+
+          Write-Host 'RDP đã bật trên cổng 3389.'
+
+      - name: 3. Bật âm thanh (Scream tùy chọn)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          foreach ($svc in 'AudioEndpointBuilder', 'Audiosrv', 'UmRdpService') {
+            Set-Service -Name $svc -StartupType Automatic -ErrorAction SilentlyContinue
+            Start-Service -Name $svc -ErrorAction SilentlyContinue
+          }
+
+          $policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          New-Item -Path $policy -Force | Out-Null
+          Set-ItemProperty -Path $policy -Name fDisableAudio -Value 0 -Type DWord
+          Set-ItemProperty -Path $policy -Name fDisableCam -Value 0 -Type DWord
+          Set-ItemProperty -Path $policy -Name UserAuthentication -Value ([int]$env:NLA) -Type DWord
+
+          $tcp = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+          Write-Host ("RDP-Tcp fDisableAudio = " + ((Get-ItemProperty -Path $tcp -Name fDisableAudio -ErrorAction SilentlyContinue).fDisableAudio))
+          Write-Host ("Policy fDisableAudio = " + ((Get-ItemProperty -Path $policy -Name fDisableAudio -ErrorAction SilentlyContinue).fDisableAudio))
+
+          Get-Service Audiosrv -ErrorAction SilentlyContinue |
+            Select-Object -Property Name, Status, StartType | Format-Table -AutoSize | Out-Host
+
+          if ($env:INSTALL_SCREAM -eq 'true') {
+            # Scream 4.0 có driver cho x64, x86 và ARM64.
+            # Chỉ dùng khi muốn thu âm thanh bằng ScreamReader; Remote Audio không cần driver này.
+            $zip = "$env:TEMP\Scream4.0.zip"
+            Invoke-WebRequest -Uri 'https://github.com/duncanthrax/scream/releases/download/4.0/Scream4.0.zip' `
+              -OutFile $zip -UseBasicParsing
+            Expand-Archive -Path $zip -DestinationPath "$env:TEMP\Scream" -Force
+
+            $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
+            $devcon = "$env:TEMP\Scream\Install\helpers\devcon-$arch.exe"
+            $inf = "$env:TEMP\Scream\Install\driver\$arch\Scream.inf"
+
+            & $devcon install $inf '*Scream' | Out-Host
+            Start-Sleep -Seconds 5
+
+            Get-PnpDevice -Class MEDIA -ErrorAction SilentlyContinue |
+              Where-Object { $_.FriendlyName -like '*Scream*' } |
+              Format-Table -AutoSize | Out-Host
+          } else {
+            Write-Host 'Bỏ qua Scream: Remote Audio của RDP là đủ để nghe tiếng.'
+          }
+
+          Write-Host 'Âm thanh: bật "Remote audio -> Play on this computer" ở mstsc để nghe tiếng.'
+
+      - name: 4. Cài Mesa OpenGL (llvmpipe) + Vulkan (lavapipe)
+        if: ${{ inputs.install_mesa }}
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
+          $root = "$env:TEMP\mesa"
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
+
+          # Lấy bản Mesa mới nhất từ mmozeiko/build-mesa.
+          try {
+            $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/mmozeiko/build-mesa/releases/latest' `
+              -Headers @{ 'User-Agent' = 'github-actions-rdp' }
+            $tag = $release.tag_name
+          } catch {
+            $tag = '26.3.1'
+            Write-Warning "Không gọi được GitHub API, dùng bản dự phòng $tag."
+          }
+          Write-Host "Mesa $tag ($arch)"
+
+          # Runner có sẵn 7-Zip nhưng không chắc nằm trong PATH.
+          $sevenZip = Join-Path $env:ProgramFiles '7-Zip\7z.exe'
+          if (-not (Test-Path $sevenZip)) {
+            $cmd = Get-Command 7z -ErrorAction SilentlyContinue
+            if (-not $cmd) { throw 'Không tìm thấy 7-Zip trên runner.' }
+            $sevenZip = $cmd.Source
+          }
+
+          function Install-MesaPackage([string]$name) {
+            $archive = Join-Path $root "$name.7z"
+            $url = "https://github.com/mmozeiko/build-mesa/releases/download/$tag/mesa-$name-$tag.7z"
+            Write-Host "Tải $url"
+            Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing
+            & $sevenZip x $archive "-o$(Join-Path $root $name)" -y | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Giải nén lỗi: $name" }
+          }
+
+          Install-MesaPackage "llvmpipe-$arch"
+          Install-MesaPackage "lavapipe-$arch"
+          if ($arch -eq 'x64') {
+            Install-MesaPackage 'llvmpipe-x86'
+            Install-MesaPackage 'lavapipe-x86'
+          }
+
+          # Đăng ký OpenGL system-wide theo cơ chế OpenGLDrivers\MSOGL của Windows.
+          function Set-OpenGL([string]$pkgDir, [string]$sysDir, [string]$regBase) {
+            Copy-Item -Path "$pkgDir\opengl32.dll" -Destination "$sysDir\mesadrv.dll" -Force
+            # Bản Mesa mới tách driver ra libgallium_wgl.dll; phải nằm cạnh để mesadrv.dll nạp được.
+            if (Test-Path "$pkgDir\libgallium_wgl.dll") {
+              Copy-Item -Path "$pkgDir\libgallium_wgl.dll" -Destination $sysDir -Force
+            }
+            $key = "$regBase\Microsoft\Windows NT\CurrentVersion\OpenGLDrivers\MSOGL"
+            & reg add $key /v DLL /t REG_SZ /d mesadrv.dll /f | Out-Null
+            & reg add $key /v DriverVersion /t REG_DWORD /d 1 /f | Out-Null
+            & reg add $key /v Flags /t REG_DWORD /d 1 /f | Out-Null
+            & reg add $key /v Version /t REG_DWORD /d 2 /f | Out-Null
+          }
+
+          Set-OpenGL "$root\llvmpipe-$arch" "$env:SystemRoot\System32" 'HKLM\SOFTWARE'
+          if ($arch -eq 'x64') {
+            Set-OpenGL "$root\llvmpipe-x86" "$env:SystemRoot\SysWOW64" 'HKLM\SOFTWARE\WOW6432Node'
+          }
+
+          # Đăng ký Vulkan ICD cho lavapipe.
+          $vkNative = "C:\Mesa\Vulkan\$arch"
+          New-Item -ItemType Directory -Path $vkNative -Force | Out-Null
+          Copy-Item -Path "$root\lavapipe-$arch\*" -Destination $vkNative -Force
+          $icdNative = (Get-ChildItem -Path "$vkNative\lvp_icd.*.json" | Select-Object -First 1).FullName
+          if (-not $icdNative) { throw "Không tìm thấy lvp_icd.*.json trong $vkNative" }
+          & reg add 'HKLM\SOFTWARE\Khronos\Vulkan\Drivers' /v $icdNative /t REG_DWORD /d 0 /f | Out-Null
+
+          if ($arch -eq 'x64') {
+            $vk32 = 'C:\Mesa\Vulkan\x86'
+            New-Item -ItemType Directory -Path $vk32 -Force | Out-Null
+            Copy-Item -Path "$root\lavapipe-x86\*" -Destination $vk32 -Force
+            $icd32 = (Get-ChildItem -Path "$vk32\lvp_icd.*.json" | Select-Object -First 1).FullName
+            if (-not $icd32) { throw "Không tìm thấy lvp_icd.*.json trong $vk32" }
+            & reg add 'HKLM\SOFTWARE\WOW6432Node\Khronos\Vulkan\Drivers' /v $icd32 /t REG_DWORD /d 0 /f | Out-Null
+          }
+
+          # Vulkan loader (vulkan-1.dll). Thử lần lượt nhiều URL của LunarG, cái nào tải được thì dùng.
+          if (-not (Test-Path "$env:SystemRoot\System32\vulkan-1.dll")) {
+            $candidates = if ($arch -eq 'arm64') {
+              @(
+                'https://sdk.lunarg.com/sdk/download/1.4.363.0/warm/VulkanRT-ARM64-1.4.363.0-Installer.exe',
+                'https://sdk.lunarg.com/sdk/download/latest/warm/VulkanRT-ARM64-Installer.exe'
+              )
+            } else {
+              @(
+                'https://sdk.lunarg.com/sdk/download/1.4.363.0/windows/VulkanRT-X64-1.4.363.0-Installer.exe',
+                'https://sdk.lunarg.com/sdk/download/latest/windows/VulkanRT-Installer.exe'
+              )
+            }
+            $installer = "$env:TEMP\VulkanRT.exe"
+            $downloaded = $false
+            foreach ($u in $candidates) {
+              try {
+                Invoke-WebRequest -Uri $u -OutFile $installer -UseBasicParsing
+                $downloaded = $true
+                Write-Host "Tải Vulkan RT từ $u"
+                break
+              } catch {
+                Write-Warning "Không tải được $u"
+              }
+            }
+            if (-not $downloaded) { throw 'Không tải được Vulkan Runtime từ bất kỳ URL nào.' }
+            $p = Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru
+            if ($p.ExitCode -notin @(0, 3010)) { throw "Cài Vulkan RT thất bại (exit $($p.ExitCode))." }
+          }
+          if (-not (Test-Path "$env:SystemRoot\System32\vulkan-1.dll")) {
+            throw 'Không cài được Vulkan loader (vulkan-1.dll).'
+          }
+
+          # Biến môi trường cho llvmpipe/lavapipe (mức Machine, áp dụng cho phiên RDP mới).
+          [Environment]::SetEnvironmentVariable('GALLIUM_DRIVER', 'llvmpipe', 'Machine')
+          [Environment]::SetEnvironmentVariable('LIBGL_ALWAYS_SOFTWARE', '1', 'Machine')
+          [Environment]::SetEnvironmentVariable('MESA_GL_VERSION_OVERRIDE', '4.6COMPAT', 'Machine')
+          [Environment]::SetEnvironmentVariable('MESA_GLSL_VERSION_OVERRIDE', '460', 'Machine')
+          [Environment]::SetEnvironmentVariable('LP_NUM_THREADS', $env:MESA_THREADS, 'Machine')
+
+          Write-Host ("OpenGL mesadrv: " + (Test-Path "$env:SystemRoot\System32\mesadrv.dll"))
+          Write-Host ("Vulkan loader: " + (Test-Path "$env:SystemRoot\System32\vulkan-1.dll"))
+          Write-Host "Mesa OK: arch=$arch | LP_NUM_THREADS=$env:MESA_THREADS"
+          Write-Host "Vulkan ICD: $icdNative"
+          if ($arch -eq 'arm64') {
+            Write-Host 'Lưu ý: app x64 chạy giả lập có thể không dùng được Mesa ARM64. Cần x64 thì chọn windows-2022.'
+          }
+
+      - name: 5. Tối ưu RAM/CPU cho RDP
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'SilentlyContinue'
+
+          # Hiệu ứng hình ảnh: ưu tiên hiệu năng.
+          $vfx = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects'
+          New-Item -Path $vfx -Force | Out-Null
+          Set-ItemProperty -Path $vfx -Name VisualFXSetting -Value 2 -Type DWord
+          Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name MenuShowDelay -Value '0'
+          Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name DragFullWindows -Value '0'
+          Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop\WindowMetrics' -Name MinAnimate -Value '0'
+          Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name EnableTransparency -Value 0 -Type DWord
+          Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name TaskbarAnimations -Value 0 -Type DWord
+          Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name TaskbarDa -Value 0 -Type DWord
+          Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name TaskbarMn -Value 0 -Type DWord
+
+          # Ứng dụng chạy nền.
+          $bg = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications'
+          New-Item -Path $bg -Force | Out-Null
+          Set-ItemProperty -Path $bg -Name GlobalUserDisabled -Value 1 -Type DWord
+
+          # Tắt các service không cần cho RDP/game.
+          foreach ($svc in 'SysMain', 'WSearch', 'Spooler', 'DiagTrack', 'dmwappushservice',
+                           'WMPNetworkSvc', 'RemoteRegistry', 'Fax', 'WerSvc') {
+            Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+            Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
+          }
+
+          # Defender: giảm CPU/RAM. Có Tamper Protection nên có thể bị chặn.
+          Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+          Set-MpPreference -DisableIOAVProtection $true -ErrorAction SilentlyContinue
+
+          # Windows Update: tắt để nhẹ máy.
+          Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue
+          Set-Service -Name wuauserv -StartupType Disabled -ErrorAction SilentlyContinue
+
+          # Tắt hibernation và dùng High Performance.
+          powercfg /h off
+          powercfg /setactive SCHEME_MIN
+          powercfg /change standby-timeout-ac 0
+          powercfg /change monitor-timeout-ac 0
+
+          Write-Host 'Đã tối ưu: visual effects, service nền, Windows Update, power plan.'
+          Get-CimInstance Win32_OperatingSystem | Select-Object `
+            @{N='RAM_Total_GB';E={[math]::Round($_.TotalVisibleMemorySize/1MB,1)}},
+            @{N='RAM_Free_GB';E={[math]::Round($_.FreePhysicalMemory/1MB,1)}} |
+            Format-Table -AutoSize | Out-Host
+
+      - name: 6. Mở tunnel (Tailscale hoặc ngrok)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $isArm = ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64')
+
+          if ($env:TUNNEL -eq 'tailscale') {
+            Write-Host 'Cài Tailscale...'
+            $msiArch = if ($isArm) { 'arm64' } else { 'amd64' }
+            $installed = $false
+            try {
+              $msi = "$env:TEMP\tailscale.msi"
+              Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-$msiArch.msi" `
+                -OutFile $msi -UseBasicParsing
+              $p = Start-Process -FilePath msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait -PassThru
+              if ($p.ExitCode -in @(0, 3010)) { $installed = $true }
+              else { Write-Warning "MSI exit $($p.ExitCode), thử bản .exe." }
+            } catch {
+              Write-Warning "Cài MSI lỗi: $($_.Exception.Message). Thử bản .exe."
+            }
+            if (-not $installed) {
+              $setup = "$env:TEMP\tailscale-setup.exe"
+              Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe' `
+                -OutFile $setup -UseBasicParsing
+              $p = Start-Process -FilePath $setup -ArgumentList '/quiet' -Wait -PassThru
+              if ($p.ExitCode -notin @(0, 3010)) { throw "Cài Tailscale thất bại (exit $($p.ExitCode))." }
+            }
+            Start-Service -Name Tailscale -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+
+            $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+            if (-not (Test-Path $ts)) { $ts = "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe" }
+            if (-not (Test-Path $ts)) { throw 'Không tìm thấy tailscale.exe sau khi cài.' }
+
+            $name = if ($env:RUNNER_NAME) { $env:RUNNER_NAME } else { $env:COMPUTERNAME }
+            $prefix = if ($isArm) { 'rdp-win11-' } else { 'rdp-' }
+            $hostname = ($prefix + $name).ToLower() -replace '[^a-z0-9-]', '-'
+            $hostname = $hostname.Substring(0, [Math]::Min(63, $hostname.Length)).Trim('-')
+
+            & $ts up "--auth-key=$env:TS_AUTHKEY" "--hostname=$hostname" --accept-routes --unattended=true
+            if ($LASTEXITCODE -ne 0) { throw "tailscale up thất bại (exit $LASTEXITCODE)." }
+
+            $ip = $null
+            $deadline = (Get-Date).AddSeconds(60)
+            while (-not $ip -and (Get-Date) -lt $deadline) {
+              $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
+              if ($ip) {
+                $ip = $ip.Trim()
+              } else {
+                Start-Sleep -Seconds 2
+              }
+            }
+            if (-not $ip) { throw 'Không lấy được Tailscale IP.' }
+
+            $rdpHost = $ip
+            $rdpPort = '3389'
+          }
+          else {
+            Write-Host 'Cài ngrok...'
+            $arch = if ($isArm) { 'arm64' } else { 'amd64' }
+            $zip = "$env:TEMP\ngrok.zip"
+            Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-$arch.zip" `
+              -OutFile $zip -UseBasicParsing
+            Expand-Archive -Path $zip -DestinationPath "$env:TEMP\ngrok" -Force
+
+            $ngrok = "$env:TEMP\ngrok\ngrok.exe"
+            & $ngrok config add-authtoken $env:NGROK_AUTHTOKEN
+            if ($LASTEXITCODE -ne 0) { throw 'Không cấu hình được ngrok authtoken.' }
+
+            $log = "$env:TEMP\ngrok.log"
+            $err = "$env:TEMP\ngrok.err"
+            Start-Process -FilePath $ngrok `
+              -ArgumentList @('tcp', '3389', '--log=stdout', '--log-format=logfmt') `
+              -RedirectStandardOutput $log -RedirectStandardError $err `
+              -WindowStyle Hidden | Out-Null
+
+            $addr = $null
+            $deadline = (Get-Date).AddSeconds(60)
+            while ((Get-Date) -lt $deadline -and -not $addr) {
+              Start-Sleep -Seconds 2
+              foreach ($f in @($log, $err)) {
+                if (-not $addr -and (Test-Path $f)) {
+                  $m = Select-String -Path $f -Pattern 'url=(tcp://[^\s"]+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+                  if ($m) { $addr = $m.Matches[0].Groups[1].Value.Trim('"', "'", ',') }
+                }
+              }
+            }
+            if (-not $addr) {
+              Get-Content $log -ErrorAction SilentlyContinue | Out-Host
+              Get-Content $err -ErrorAction SilentlyContinue | Out-Host
+              throw 'Không lấy được địa chỉ ngrok TCP.'
+            }
+
+            $uri = [Uri]$addr
+            $rdpHost = $uri.Host
+            $rdpPort = "$($uri.Port)"
+          }
+
+          "RDP_HOST=$rdpHost" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RDP_PORT=$rdpPort" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          $title = if ($isArm) { '## RDP đã sẵn sàng (Windows 11 ARM64)' } else { '## RDP đã sẵn sàng (Windows Server 2022)' }
+          $summary = @(
+            $title,
+            '',
+            "- **Host:** $rdpHost",
+            "- **Port:** $rdpPort",
+            "- **User:** runneradmin",
+            "- **Password:** secret RDP_PASSWORD",
+            "- **Audio:** mstsc > Local Resources > Remote audio > Play on this computer",
+            '',
+            "Kết nối: ``mstsc /v:${rdpHost}:${rdpPort}``"
+          ) -join "`n"
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+          Write-Host "RDP: ${rdpHost}:${rdpPort}"
+
+      - name: 7. Tạo file .rdp
+        if: always()
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_HOST)) {
+            Write-Host 'Không có RDP_HOST, bỏ qua tạo file .rdp.'
+            exit 0
+          }
+          $content = @(
+            "full address:s:$($env:RDP_HOST):$($env:RDP_PORT)",
+            'username:s:runneradmin',
+            'audiomode:i:0',
+            'redirectclipboard:i:1',
+            'redirectprinters:i:0',
+            'authentication level:i:0',
+            "enablecredsspsupport:i:$($env:NLA)",
+            'screen mode id:i:2',
+            'desktopwidth:i:1280',
+            'desktopheight:i:720',
+            'session bpp:i:32',
+            'smart sizing:i:1',
+            'bandwidthautodetect:i:1',
+            'networkautodetect:i:1'
+          )
+          Set-Content -Path "$env:GITHUB_WORKSPACE\rdp.rdp" -Value $content -Encoding ASCII
+          Write-Host 'Đã tạo rdp.rdp (1280x720, audio về máy client).'
+
+      - name: 8. Lưu file .rdp
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-connection-file
+          path: rdp.rdp
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 1
+
+      - name: 9. Giữ session (tối đa ~5 giờ 30 phút)
+        if: success()
+        shell: pwsh
+        run: |
+          Write-Host "RDP đang chạy: $($env:RDP_HOST):$($env:RDP_PORT) | User: runneradmin"
+          Write-Host 'Nhấn Cancel workflow khi không cần nữa để giải phóng máy.'
+          $end = (Get-Date).AddMinutes(330)
+          $nextLog = (Get-Date).AddMinutes(30)
+          while ((Get-Date) -lt $end) {
+            Start-Sleep -Seconds 60
+            if ((Get-Date) -ge $nextLog) {
+              Write-Host "Vẫn hoạt động: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+              $nextLog = (Get-Date).AddMinutes(30)
+            }
+          }
